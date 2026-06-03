@@ -36,6 +36,12 @@ FONT_RE = re.compile(r"font-family\s*:\s*([^;}{]+)", re.I)
 RADIUS_RE = re.compile(r"border-radius\s*:\s*([0-9.]+)px", re.I)
 BG_URL_RE = re.compile(r"background(?:-image)?\s*:\s*[^;]*url\(([^)]+)\)", re.I)
 LOGO_RE = re.compile(r"logo", re.I)
+# Hints used to tell a brand mark apart from a generic UI icon (search, menu, etc.).
+BRAND_HINT = re.compile(r"logo|brand|site-?title|navbar-brand", re.I)
+ICON_HINT = re.compile(
+    r"\b(icon|search|magnif|menu|hamburger|close|arrow|chevron|caret|social|share|cart|toggle|burger)\b",
+    re.I,
+)
 
 GENERIC_FONTS = {
     "inherit", "initial", "unset", "sans-serif", "serif", "monospace",
@@ -216,8 +222,31 @@ def extract_rounded(css: str) -> dict:
     return {"sm": "4px", "md": "8px"}
 
 
-def _in_header(el) -> bool:
-    return any(getattr(p, "name", None) in ("header", "nav") for p in el.parents)
+def _has_brand_ancestor(svg) -> bool:
+    """True if the SVG is wrapped in a logo/brand element or a link to home."""
+    for parent in svg.parents:
+        blob = f"{' '.join(parent.get('class') or [])} {parent.get('id') or ''}"
+        if BRAND_HINT.search(blob):
+            return True
+        if getattr(parent, "name", None) == "a" and (parent.get("href") or "") in ("/", "#"):
+            return True
+    return False
+
+
+def _svg_looks_like_logo(svg) -> bool:
+    """Accept a brand-mark SVG; reject generic UI icons (search, menu, arrows...)."""
+    self_blob = f"{' '.join(svg.get('class') or [])} {svg.get('id') or ''} {svg.get('aria-label') or ''}"
+    branded = bool(BRAND_HINT.search(self_blob)) or _has_brand_ancestor(svg)
+    if not branded:
+        return False
+    # Decorative or icon-shaped SVGs are not the logo even if near brand markup.
+    if svg.get("aria-hidden") == "true":
+        return False
+    if ICON_HINT.search(self_blob) and not BRAND_HINT.search(self_blob):
+        return False
+    if (svg.get("width") or "").strip().lower().endswith("em") and not BRAND_HINT.search(self_blob):
+        return False
+    return True
 
 
 def _real_img_url(img) -> str | None:
@@ -241,11 +270,9 @@ def _real_img_url(img) -> str | None:
 def extract_logo(html: str, base_url: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. Inline SVG with a logo hint or sitting in the header/nav.
+    # 1. Inline SVG that genuinely looks like a brand mark (not a UI icon).
     for svg in soup.find_all("svg"):
-        classes = " ".join(svg.get("class") or [])
-        hint = f"{classes} {svg.get('id') or ''} {svg.get('aria-label') or ''}".lower()
-        if "logo" in hint or _in_header(svg):
+        if _svg_looks_like_logo(svg):
             return {"type": "svg", "svg": str(svg), "url": None}
 
     # 2. <img> whose attributes hint "logo" -> resolve its real (possibly lazy) URL.
