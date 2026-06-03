@@ -30,8 +30,13 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+playwright install chromium      # optional: enables the headless-browser fallback
 uvicorn main:app --reload --port 8000
 ```
+
+The `playwright install chromium` step is optional — it downloads a headless
+browser used only as a last-resort fallback for sites with JavaScript bot
+challenges. Without it, the tool still works using the faster HTTP layers.
 
 ### 2. Frontend (port 5173)
 
@@ -109,10 +114,20 @@ spacing:
 
 ## Notes / limitations
 
-- Extraction is **heuristic**. Palette assignment ranks colors by frequency and
-  classifies them by lightness/saturation; fonts come from `font-family`
-  declarations. Review and tweak the output before using it.
-- Font sizes and spacing use sensible defaults (matching the token format) since
-  they don't reverse-engineer reliably from arbitrary CSS.
-- Some sites block automated requests or load styles via JavaScript the scraper
-  can't see; results vary by site.
+- **Getting past bot defenses.** Fetching escalates through three layers:
+  (1) `curl_cffi` impersonating Chrome's TLS fingerprint, which defeats
+  fingerprint-based blocks; (2) plain `httpx` if `curl_cffi` isn't installed;
+  (3) headless Chromium via Playwright, which runs the page's JavaScript and
+  clears most "checking your browser" challenges. The very aggressive setups
+  (advanced Cloudflare/DataDome with behavioral analysis + IP reputation) can
+  still block even a headless browser without residential proxies — those sites
+  may simply not be scrapable with a local tool.
+- **Logo detection is scored, not first-match.** Sources are ranked by how
+  trustworthy they are as the real brand mark: JSON-LD `Organization.logo` and
+  `og:logo` first, then a logo-classed or home-link `<img>`, then a genuine
+  brand SVG, then favicons / `og:image`. UI icons (search, menu, map pins, and
+  square unlabeled glyphs) are actively rejected so they don't get mistaken for
+  the logo. It's still heuristic — review the result.
+- Extraction is heuristic overall. Palette assignment ranks colors by frequency
+  and classifies them by lightness/saturation; fonts come from `font-family`
+  declarations. Font sizes and spacing use sensible defaults.

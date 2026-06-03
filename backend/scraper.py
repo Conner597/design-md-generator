@@ -1,20 +1,31 @@
 """Scrape a firm's homepage and reverse-engineer design tokens.
 
+Fetching escalates through three layers to get past bot defenses:
+  1. curl_cffi with browser TLS impersonation (defeats fingerprint blocks)
+  2. plain httpx (fallback when curl_cffi isn't installed)
+  3. a headless browser via Playwright (defeats JavaScript challenges)
+Layers 1/3 are optional dependencies; the tool degrades gracefully without them.
+
 All extraction is heuristic: it reads the site's published CSS/HTML and makes a
-best guess at the palette, fonts, radii, and logo. Output is meant to be
-reviewed and adjusted by a human, not trusted blindly.
+best guess at the palette, fonts, radii, and logo. Output should be reviewed.
 """
 from __future__ import annotations
 
+import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
 
-# A realistic browser header set. Many sites reject requests whose User-Agent
-# self-identifies as a bot or that omit the usual browser headers.
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL_CFFI = True
+except Exception:  # pragma: no cover - optional dependency
+    HAS_CURL_CFFI = False
+
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -24,7 +35,6 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Ad/analytics query params that should be dropped before fetching.
 TRACKING_PARAMS = {
     "gclid", "gad_source", "gad_campaignid", "gbraid", "wbraid", "fbclid",
     "msclkid", "mc_cid", "mc_eid", "yclid", "_hsenc", "_hsmi",
@@ -36,10 +46,10 @@ FONT_RE = re.compile(r"font-family\s*:\s*([^;}{]+)", re.I)
 RADIUS_RE = re.compile(r"border-radius\s*:\s*([0-9.]+)px", re.I)
 BG_URL_RE = re.compile(r"background(?:-image)?\s*:\s*[^;]*url\(([^)]+)\)", re.I)
 LOGO_RE = re.compile(r"logo", re.I)
-# Hints used to tell a brand mark apart from a generic UI icon (search, menu, etc.).
 BRAND_HINT = re.compile(r"logo|brand|site-?title|navbar-brand", re.I)
 ICON_HINT = re.compile(
-    r"\b(icon|search|magnif|menu|hamburger|close|arrow|chevron|caret|social|share|cart|toggle|burger)\b",
+    r"\b(icon|search|magnif|menu|hamburger|close|arrow|chevron|caret|social|"
+    r"share|cart|toggle|burger|pin|marker|location|map|place|geo|phone|mail|envelope)\b",
     re.I,
 )
 
@@ -56,6 +66,12 @@ DEFAULT_COLORS = {
     "neutral": "#F7F5F2",
 }
 
+_CSS_DUMP_JS = (
+    "() => { let out = []; for (const s of document.styleSheets) { try { "
+    "for (const r of (s.cssRules || [])) out.push(r.cssText); } catch (e) {} } "
+    "return out.join('\\n'); }"
+)
+
 
 @dataclass
 class ScrapeResult:
@@ -68,6 +84,9 @@ class ScrapeResult:
     logo: dict
 
 
+# --------------------------------------------------------------------------- #
+# Color helpers
+# --------------------------------------------------------------------------- #
 def _normalize_hex(value: str) -> str:
     h = value.lstrip("#")
     if len(h) == 3:
@@ -98,6 +117,9 @@ def _hex_to_hsl(hex_str: str) -> tuple[float, float, float]:
     return hue * 60, sat, light
 
 
+# --------------------------------------------------------------------------- #
+# Fetching (layered anti-bot)
+# --------------------------------------------------------------------------- #
 def _clean_url(url: str) -> str:
     if not urlparse(url).scheme:
         url = "https://" + url
@@ -111,33 +133,78 @@ def _root(url: str) -> str:
     return urlunparse((parts.scheme, parts.netloc, "/", "", "", ""))
 
 
-def fetch_site(url: str) -> tuple[str, str, str]:
-    """Return (final_url, html, combined_css).
+@contextmanager
+def _session():
+    """Yield an HTTP session: curl_cffi (impersonating Chrome) if available, else httpx."""
+    if HAS_CURL_CFFI:
+        sess = cffi_requests.Session()
+        try:
+            yield sess
+        finally:
+            sess.close()
+    else:
+        client = httpx.Client(follow_redirects=True, timeout=20.0, headers=BROWSER_HEADERS)
+        try:
+            yield client
+        finally:
+            client.close()
 
-    Tries the cleaned URL first, then falls back to the bare homepage if the
-    first attempt is blocked or fails.
-    """
+
+def _get(session, url: str):
+    if HAS_CURL_CFFI:
+        resp = session.get(url, impersonate="chrome", timeout=25, allow_redirects=True)
+    else:
+        resp = session.get(url)
+    resp.raise_for_status()
+    return resp
+
+
+def _browser_fetch(url: str) -> tuple[str, str, str]:
+    """Render the page in headless Chromium to get past JavaScript challenges."""
+    from playwright.sync_api import sync_playwright  # optional dependency
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(user_agent=BROWSER_HEADERS["User-Agent"])
+            page.goto(url, wait_until="networkidle", timeout=40_000)
+            html = page.content()
+            final_url = page.url
+            css = page.evaluate(_CSS_DUMP_JS)
+        finally:
+            browser.close()
+    return final_url, html, css or ""
+
+
+def fetch_site(url: str) -> tuple[str, str, str]:
+    """Return (final_url, html, combined_css), escalating through anti-bot layers."""
     cleaned = _clean_url(url)
     candidates = [cleaned]
-    root = _root(cleaned)
-    if root != cleaned:
-        candidates.append(root)
+    if _root(cleaned) != cleaned:
+        candidates.append(_root(cleaned))
 
     last_error: Exception | None = None
-    with httpx.Client(follow_redirects=True, timeout=20.0, headers=BROWSER_HEADERS) as client:
+    with _session() as sess:
         for candidate in candidates:
             try:
-                resp = client.get(candidate)
-                resp.raise_for_status()
+                resp = _get(sess, candidate)
+                final_url = str(resp.url)
                 html = resp.text
-                css = _gather_css(client, html, str(resp.url))
-                return str(resp.url), html, css
-            except Exception as exc:  # noqa: BLE001 - try the next candidate
+                return final_url, html, _gather_css(sess, html, final_url)
+            except Exception as exc:  # noqa: BLE001 - try the next layer/candidate
                 last_error = exc
+
+    # Final layer: headless browser (handles JS challenges). Optional dependency;
+    # if Playwright or its browser isn't installed, this raises and we surface the
+    # original HTTP error instead.
+    try:
+        return _browser_fetch(cleaned)
+    except Exception as exc:  # noqa: BLE001
+        last_error = last_error or exc
     raise last_error if last_error else RuntimeError("Could not fetch the site.")
 
 
-def _gather_css(client: httpx.Client, html: str, base_url: str, max_sheets: int = 8) -> str:
+def _gather_css(session, html: str, base_url: str, max_sheets: int = 8) -> str:
     soup = BeautifulSoup(html, "html.parser")
     parts: list[str] = []
     for style in soup.find_all("style"):
@@ -153,12 +220,15 @@ def _gather_css(client: httpx.Client, html: str, base_url: str, max_sheets: int 
             hrefs.append(urljoin(base_url, link["href"]))
     for href in hrefs[:max_sheets]:
         try:
-            parts.append(client.get(href).text[:500_000])
+            parts.append(_get(session, href).text[:500_000])
         except Exception:
             continue
     return "\n".join(parts)
 
 
+# --------------------------------------------------------------------------- #
+# Token extraction
+# --------------------------------------------------------------------------- #
 def extract_colors(css: str, html: str) -> dict:
     counts: dict[str, int] = {}
     text = css + " " + html
@@ -222,9 +292,20 @@ def extract_rounded(css: str) -> dict:
     return {"sm": "4px", "md": "8px"}
 
 
-def _has_brand_ancestor(svg) -> bool:
-    """True if the SVG is wrapped in a logo/brand element or a link to home."""
-    for parent in svg.parents:
+# --------------------------------------------------------------------------- #
+# Logo detection (scored: prefer the real brand mark, reject UI icons)
+# --------------------------------------------------------------------------- #
+def _attr_blob(el) -> str:
+    cls = " ".join(el.get("class") or [])
+    return f"{cls} {el.get('id') or ''} {el.get('alt') or ''} {el.get('aria-label') or ''}".lower()
+
+
+def _in_header(el) -> bool:
+    return any(getattr(p, "name", None) in ("header", "nav") for p in el.parents)
+
+
+def _has_brand_ancestor(el) -> bool:
+    for parent in el.parents:
         blob = f"{' '.join(parent.get('class') or [])} {parent.get('id') or ''}"
         if BRAND_HINT.search(blob):
             return True
@@ -233,28 +314,40 @@ def _has_brand_ancestor(svg) -> bool:
     return False
 
 
+def _svg_is_square(svg) -> bool:
+    vb = svg.get("viewBox") or svg.get("viewbox")
+    if vb:
+        nums = re.findall(r"-?\d+\.?\d*", vb)
+        if len(nums) == 4 and float(nums[2]) and float(nums[3]):
+            ratio = abs(float(nums[2]) / float(nums[3]))
+            return 0.7 <= ratio <= 1.4
+    w = re.findall(r"\d+\.?\d*", svg.get("width") or "")
+    h = re.findall(r"\d+\.?\d*", svg.get("height") or "")
+    if w and h and float(w[0]) and float(h[0]):
+        return 0.7 <= float(w[0]) / float(h[0]) <= 1.4
+    return False
+
+
 def _svg_looks_like_logo(svg) -> bool:
-    """Accept a brand-mark SVG; reject generic UI icons (search, menu, arrows...)."""
-    self_blob = f"{' '.join(svg.get('class') or [])} {svg.get('id') or ''} {svg.get('aria-label') or ''}"
-    branded = bool(BRAND_HINT.search(self_blob)) or _has_brand_ancestor(svg)
-    if not branded:
+    """Accept a brand-mark SVG; reject UI icons (search, menu, map pins, square glyphs)."""
+    self_blob = _attr_blob(svg)
+    self_branded = bool(BRAND_HINT.search(self_blob))
+    if not (self_branded or _has_brand_ancestor(svg)):
         return False
-    # Decorative or icon-shaped SVGs are not the logo even if near brand markup.
     if svg.get("aria-hidden") == "true":
         return False
-    if ICON_HINT.search(self_blob) and not BRAND_HINT.search(self_blob):
+    if ICON_HINT.search(self_blob) and not self_branded:
         return False
-    if (svg.get("width") or "").strip().lower().endswith("em") and not BRAND_HINT.search(self_blob):
+    if (svg.get("width") or "").strip().lower().endswith("em") and not self_branded:
+        return False
+    # Icons are square; brand wordmarks are usually wider than tall. Only trust a
+    # square SVG as a logo if it explicitly carries a logo/brand label itself.
+    if _svg_is_square(svg) and not self_branded:
         return False
     return True
 
 
 def _real_img_url(img) -> str | None:
-    """Return the best real image URL from an <img>, accounting for lazy-loading.
-
-    Many sites put a placeholder (or nothing) in src and the real URL in
-    data-src / data-lazy-src / srcset, so check those first and skip data: URIs.
-    """
     for attr in ("data-src", "data-lazy-src", "data-original", "src"):
         val = (img.get(attr) or "").strip()
         if val and not val.startswith("data:"):
@@ -267,49 +360,114 @@ def _real_img_url(img) -> str | None:
     return None
 
 
-def extract_logo(html: str, base_url: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
+def _is_tiny(img) -> bool:
+    for dim in (img.get("width"), img.get("height")):
+        m = re.match(r"\s*(\d+)", dim or "")
+        if m and int(m.group(1)) <= 24:
+            return True
+    return False
 
-    # 1. Inline SVG that genuinely looks like a brand mark (not a UI icon).
+
+def _find_logo_in_jsonld(node) -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        logo = node.get("logo")
+        if isinstance(logo, str):
+            found.append(logo)
+        elif isinstance(logo, dict) and isinstance(logo.get("url"), str):
+            found.append(logo["url"])
+        for value in node.values():
+            found.extend(_find_logo_in_jsonld(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_find_logo_in_jsonld(item))
+    return found
+
+
+def _jsonld_logos(soup) -> list[str]:
+    out: list[str] = []
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            out.extend(_find_logo_in_jsonld(json.loads(tag.string or "")))
+        except Exception:
+            continue
+    return out
+
+
+def _icon_href(soup, want: str) -> str | None:
+    for link in soup.find_all("link"):
+        rel = link.get("rel") or []
+        rel = [rel] if isinstance(rel, str) else rel
+        if any(want in str(r).lower() for r in rel) and link.get("href"):
+            return link["href"]
+    return None
+
+
+def extract_logo(html: str, base_url: str) -> dict:
+    """Score every plausible logo source and return the best one.
+
+    Higher score = more trustworthy as the actual brand mark. Explicit
+    declarations (JSON-LD, og:logo) beat the home-link/logo-classed image, which
+    beats a genuine brand SVG, which beats favicons and share images.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    candidates: list[tuple[int, str, str]] = []  # (score, kind, payload)
+
+    for ref in _jsonld_logos(soup):
+        if ref and not ref.startswith("data:"):
+            candidates.append((100, "img", urljoin(base_url, ref)))
+
+    og_logo = soup.find("meta", property="og:logo")
+    if og_logo and og_logo.get("content"):
+        candidates.append((90, "img", urljoin(base_url, og_logo["content"])))
+
+    for img in soup.find_all("img"):
+        src = _real_img_url(img)
+        if not src:
+            continue
+        score = 0
+        if "logo" in _attr_blob(img):
+            score += 50
+        if "logo" in src.lower():
+            score += 30
+        if _has_brand_ancestor(img):
+            score += 40
+        if _in_header(img):
+            score += 12
+        if _is_tiny(img):
+            score -= 25
+        if score > 0:
+            candidates.append((min(score, 95), "img", urljoin(base_url, src)))
+
     for svg in soup.find_all("svg"):
         if _svg_looks_like_logo(svg):
-            return {"type": "svg", "svg": str(svg), "url": None}
+            score = 55 if BRAND_HINT.search(_attr_blob(svg)) else 38
+            candidates.append((score, "svg", str(svg)))
 
-    # 2. <img> whose attributes hint "logo" -> resolve its real (possibly lazy) URL.
-    for img in soup.find_all("img"):
-        attrs = [" ".join(img.get("class")) if img.get("class") else None, img.get("id"),
-                 img.get("alt"), img.get("src"), img.get("data-src")]
-        hint = " ".join(filter(None, attrs)).lower()
-        if "logo" in hint:
-            src = _real_img_url(img)
-            if src:
-                return {"type": "img", "url": urljoin(base_url, src), "svg": None}
-
-    # 3. CSS background-image on an element whose class/id hints "logo".
     for el in soup.find_all(class_=LOGO_RE) + soup.find_all(id=LOGO_RE):
         match = BG_URL_RE.search(el.get("style") or "")
         if match:
             ref = match.group(1).strip().strip("'\"")
             if ref and not ref.startswith("data:"):
-                return {"type": "img", "url": urljoin(base_url, ref), "svg": None}
+                candidates.append((45, "img", urljoin(base_url, ref)))
 
-    # 4. Social / icon fallbacks.
-    og = soup.find("meta", property="og:image")
-    if og and og.get("content"):
-        return {"type": "img", "url": urljoin(base_url, og["content"]), "svg": None}
-    for want in ("apple-touch-icon", "icon"):
-        for link in soup.find_all("link"):
-            rel = link.get("rel") or []
-            rel = [rel] if isinstance(rel, str) else rel
-            if any(want in str(r).lower() for r in rel) and link.get("href"):
-                return {"type": "img", "url": urljoin(base_url, link["href"]), "svg": None}
+    apple = _icon_href(soup, "apple-touch-icon")
+    if apple:
+        candidates.append((22, "img", urljoin(base_url, apple)))
+    icon = _icon_href(soup, "icon")
+    if icon:
+        candidates.append((14, "img", urljoin(base_url, icon)))
+    og_image = soup.find("meta", property="og:image")
+    if og_image and og_image.get("content"):
+        candidates.append((16, "img", urljoin(base_url, og_image["content"])))
 
-    # 5. Last resort: first image with a real URL.
-    for img in soup.find_all("img"):
-        src = _real_img_url(img)
-        if src:
-            return {"type": "img", "url": urljoin(base_url, src), "svg": None}
-    return {"type": "none", "url": None, "svg": None}
+    if not candidates:
+        return {"type": "none", "url": None, "svg": None}
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    _, kind, payload = candidates[0]
+    if kind == "svg":
+        return {"type": "svg", "svg": payload, "url": None}
+    return {"type": "img", "url": payload, "svg": None}
 
 
 def scrape(firm_name: str, url: str) -> ScrapeResult:
