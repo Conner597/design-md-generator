@@ -8,17 +8,34 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
 
-USER_AGENT = "Mozilla/5.0 (compatible; DesignMDGenerator/1.0)"
+# A realistic browser header set. Many sites reject requests whose User-Agent
+# self-identifies as a bot or that omit the usual browser headers.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Ad/analytics query params that should be dropped before fetching.
+TRACKING_PARAMS = {
+    "gclid", "gad_source", "gad_campaignid", "gbraid", "wbraid", "fbclid",
+    "msclkid", "mc_cid", "mc_eid", "yclid", "_hsenc", "_hsmi",
+}
 
 HEX_RE = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
 RGB_RE = re.compile(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})", re.I)
 FONT_RE = re.compile(r"font-family\s*:\s*([^;}{]+)", re.I)
 RADIUS_RE = re.compile(r"border-radius\s*:\s*([0-9.]+)px", re.I)
+BG_URL_RE = re.compile(r"background(?:-image)?\s*:\s*[^;]*url\(([^)]+)\)", re.I)
+LOGO_RE = re.compile(r"logo", re.I)
 
 GENERIC_FONTS = {
     "inherit", "initial", "unset", "sans-serif", "serif", "monospace",
@@ -75,17 +92,43 @@ def _hex_to_hsl(hex_str: str) -> tuple[float, float, float]:
     return hue * 60, sat, light
 
 
-def fetch_site(url: str) -> tuple[str, str, str]:
-    """Return (final_url, html, combined_css)."""
+def _clean_url(url: str) -> str:
     if not urlparse(url).scheme:
         url = "https://" + url
-    headers = {"User-Agent": USER_AGENT}
-    with httpx.Client(follow_redirects=True, timeout=15.0, headers=headers) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        html = resp.text
-        css = _gather_css(client, html, str(resp.url))
-        return str(resp.url), html, css
+    parts = urlparse(url)
+    query = {k: v for k, v in parse_qs(parts.query).items() if k.lower() not in TRACKING_PARAMS}
+    return urlunparse(parts._replace(query=urlencode(query, doseq=True)))
+
+
+def _root(url: str) -> str:
+    parts = urlparse(url)
+    return urlunparse((parts.scheme, parts.netloc, "/", "", "", ""))
+
+
+def fetch_site(url: str) -> tuple[str, str, str]:
+    """Return (final_url, html, combined_css).
+
+    Tries the cleaned URL first, then falls back to the bare homepage if the
+    first attempt is blocked or fails.
+    """
+    cleaned = _clean_url(url)
+    candidates = [cleaned]
+    root = _root(cleaned)
+    if root != cleaned:
+        candidates.append(root)
+
+    last_error: Exception | None = None
+    with httpx.Client(follow_redirects=True, timeout=20.0, headers=BROWSER_HEADERS) as client:
+        for candidate in candidates:
+            try:
+                resp = client.get(candidate)
+                resp.raise_for_status()
+                html = resp.text
+                css = _gather_css(client, html, str(resp.url))
+                return str(resp.url), html, css
+            except Exception as exc:  # noqa: BLE001 - try the next candidate
+                last_error = exc
+    raise last_error if last_error else RuntimeError("Could not fetch the site.")
 
 
 def _gather_css(client: httpx.Client, html: str, base_url: str, max_sheets: int = 8) -> str:
@@ -177,25 +220,56 @@ def _in_header(el) -> bool:
     return any(getattr(p, "name", None) in ("header", "nav") for p in el.parents)
 
 
+def _real_img_url(img) -> str | None:
+    """Return the best real image URL from an <img>, accounting for lazy-loading.
+
+    Many sites put a placeholder (or nothing) in src and the real URL in
+    data-src / data-lazy-src / srcset, so check those first and skip data: URIs.
+    """
+    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+        val = (img.get(attr) or "").strip()
+        if val and not val.startswith("data:"):
+            return val
+    for attr in ("srcset", "data-srcset"):
+        val = img.get(attr) or ""
+        first = val.split(",")[0].strip().split(" ")[0]
+        if first and not first.startswith("data:"):
+            return first
+    return None
+
+
 def extract_logo(html: str, base_url: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
 
+    # 1. Inline SVG with a logo hint or sitting in the header/nav.
     for svg in soup.find_all("svg"):
         classes = " ".join(svg.get("class") or [])
         hint = f"{classes} {svg.get('id') or ''} {svg.get('aria-label') or ''}".lower()
         if "logo" in hint or _in_header(svg):
             return {"type": "svg", "svg": str(svg), "url": None}
 
+    # 2. <img> whose attributes hint "logo" -> resolve its real (possibly lazy) URL.
     for img in soup.find_all("img"):
-        classes = " ".join(img.get("class") or [])
-        hint = f"{classes} {img.get('id') or ''} {img.get('alt') or ''} {img.get('src') or ''}".lower()
-        if "logo" in hint and img.get("src"):
-            return {"type": "img", "url": urljoin(base_url, img["src"]), "svg": None}
+        attrs = [" ".join(img.get("class")) if img.get("class") else None, img.get("id"),
+                 img.get("alt"), img.get("src"), img.get("data-src")]
+        hint = " ".join(filter(None, attrs)).lower()
+        if "logo" in hint:
+            src = _real_img_url(img)
+            if src:
+                return {"type": "img", "url": urljoin(base_url, src), "svg": None}
 
+    # 3. CSS background-image on an element whose class/id hints "logo".
+    for el in soup.find_all(class_=LOGO_RE) + soup.find_all(id=LOGO_RE):
+        match = BG_URL_RE.search(el.get("style") or "")
+        if match:
+            ref = match.group(1).strip().strip("'\"")
+            if ref and not ref.startswith("data:"):
+                return {"type": "img", "url": urljoin(base_url, ref), "svg": None}
+
+    # 4. Social / icon fallbacks.
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
         return {"type": "img", "url": urljoin(base_url, og["content"]), "svg": None}
-
     for want in ("apple-touch-icon", "icon"):
         for link in soup.find_all("link"):
             rel = link.get("rel") or []
@@ -203,9 +277,11 @@ def extract_logo(html: str, base_url: str) -> dict:
             if any(want in str(r).lower() for r in rel) and link.get("href"):
                 return {"type": "img", "url": urljoin(base_url, link["href"]), "svg": None}
 
-    first = soup.find("img")
-    if first and first.get("src"):
-        return {"type": "img", "url": urljoin(base_url, first["src"]), "svg": None}
+    # 5. Last resort: first image with a real URL.
+    for img in soup.find_all("img"):
+        src = _real_img_url(img)
+        if src:
+            return {"type": "img", "url": urljoin(base_url, src), "svg": None}
     return {"type": "none", "url": None, "svg": None}
 
 
