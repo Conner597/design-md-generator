@@ -45,6 +45,9 @@ RGB_RE = re.compile(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})", re.I
 FONT_RE = re.compile(r"font-family\s*:\s*([^;}{]+)", re.I)
 RADIUS_RE = re.compile(r"border-radius\s*:\s*([0-9.]+)px", re.I)
 BG_URL_RE = re.compile(r"background(?:-image)?\s*:\s*[^;]*url\(([^)]+)\)", re.I)
+CSS_VAR_DEF_RE = re.compile(r"(--[\w-]+)\s*:\s*([^;}{]+)")
+VAR_USE_RE = re.compile(r"var\(\s*(--[\w-]+)")
+BG_DECL_RE = re.compile(r"background(?:-color)?\s*:\s*([^;}{]+)", re.I)
 LOGO_RE = re.compile(r"logo", re.I)
 BRAND_HINT = re.compile(r"logo|brand|site-?title|navbar-brand", re.I)
 ICON_HINT = re.compile(
@@ -115,6 +118,22 @@ def _hex_to_hsl(hex_str: str) -> tuple[float, float, float]:
     else:
         hue = (r - g) / delta + 4
     return hue * 60, sat, light
+
+
+def _hsv_sat(hex_str: str) -> float:
+    """Colorfulness independent of darkness (HSV saturation = delta/max).
+
+    HSL saturation is misleadingly low for dark colors like a deep brand green;
+    HSV saturation stays high, so it's the better 'is this a real color' test.
+    """
+    h = hex_str.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    mx, mn = max(r, g, b), min(r, g, b)
+    return 0.0 if mx == 0 else (mx - mn) / mx
+
+
+def _is_chromatic(hex_str: str) -> bool:
+    return _hsv_sat(hex_str) > 0.15
 
 
 # --------------------------------------------------------------------------- #
@@ -229,29 +248,67 @@ def _gather_css(session, html: str, base_url: str, max_sheets: int = 8) -> str:
 # --------------------------------------------------------------------------- #
 # Token extraction
 # --------------------------------------------------------------------------- #
-def extract_colors(css: str, html: str) -> dict:
-    counts: dict[str, int] = {}
+def _collect_color_weights(css: str, html: str) -> dict:
+    """Tally colors, weighting the signals that actually indicate a brand color.
+
+    Counts literal hex/rgb, but adds extra weight for colors used in backgrounds,
+    colors referenced through CSS variables (resolving the variable to its value),
+    and the <meta name="theme-color"> brand declaration.
+    """
+    weights: dict[str, int] = {}
+
+    def add(hex_value: str, amount: int = 1) -> None:
+        weights[hex_value] = weights.get(hex_value, 0) + amount
+
+    def colors_in(blob: str) -> list[str]:
+        out = [_normalize_hex(m) for m in HEX_RE.findall(blob)]
+        out += [_rgb_to_hex(int(r), int(g), int(b)) for r, g, b in RGB_RE.findall(blob)]
+        return out
+
     text = css + " " + html
-    for match in HEX_RE.findall(text):
-        hx = _normalize_hex(match)
-        counts[hx] = counts.get(hx, 0) + 1
-    for r, g, b in RGB_RE.findall(text):
-        hx = _rgb_to_hex(int(r), int(g), int(b))
-        counts[hx] = counts.get(hx, 0) + 1
-    if not counts:
+    for hx in colors_in(text):
+        add(hx, 1)
+    # Brand colors are usually backgrounds — weight those more.
+    for decl in BG_DECL_RE.findall(css):
+        for hx in colors_in(decl):
+            add(hx, 3)
+    # Resolve CSS variables: map --name -> hex, then count each var() usage.
+    var_hex: dict[str, str] = {}
+    for name, value in CSS_VAR_DEF_RE.findall(css):
+        found = colors_in(value)
+        if found:
+            var_hex[name] = found[0]
+    for name in VAR_USE_RE.findall(css):
+        if name in var_hex:
+            add(var_hex[name], 3)
+    # theme-color meta is an explicit brand-color declaration.
+    meta = BeautifulSoup(html, "html.parser").find("meta", attrs={"name": "theme-color"})
+    if meta and meta.get("content"):
+        for hx in colors_in(meta["content"]):
+            add(hx, 25)
+    return weights
+
+
+def extract_colors(css: str, html: str) -> dict:
+    weights = _collect_color_weights(css, html)
+    if not weights:
         return dict(DEFAULT_COLORS)
 
-    ranked = [h for h, _ in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)]
-    light = next((h for h in ranked if _hex_to_hsl(h)[2] > 0.85), None)
-    dark = next((h for h in ranked if _hex_to_hsl(h)[2] < 0.25), None)
-    accents = [h for h in ranked if _hex_to_hsl(h)[1] > 0.25 and h not in (light, dark)]
+    ranked = [h for h, _ in sorted(weights.items(), key=lambda kv: kv[1], reverse=True)]
+    chromatic = [h for h in ranked if _is_chromatic(h)]
+    light = next((h for h in ranked if _hex_to_hsl(h)[2] > 0.82), None)
 
     chosen: dict[str, str | None] = {
-        "primary": dark,
-        "secondary": accents[0] if accents else None,
-        "tertiary": accents[1] if len(accents) > 1 else None,
-        "neutral": light,
+        "primary": None, "secondary": None, "tertiary": None, "neutral": light,
     }
+    # Lead with the actual brand colors (most prominent chromatic ones).
+    pool = list(chromatic)
+    for key in ("primary", "secondary", "tertiary"):
+        if pool:
+            chosen[key] = pool.pop(0)
+    # Monochrome brand (no chromatic colors): fall back to the dominant dark tone.
+    if not chosen["primary"]:
+        chosen["primary"] = next((h for h in ranked if _hex_to_hsl(h)[2] < 0.3), None)
 
     def next_unused() -> str | None:
         used = {v for v in chosen.values() if v}
