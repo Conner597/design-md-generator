@@ -1,19 +1,13 @@
 """Render a ScrapeResult into a DESIGN.md string.
 
-Format: machine-readable YAML front matter (design tokens) followed by
-human-readable markdown prose (Overview, Colors, Logo). The logo is embedded
-as inline SVG when available, otherwise referenced by URL.
+Format: YAML front matter (design tokens) followed by human-readable markdown
+sections matching Firecrawl's branding output: Colors, Fonts, Typography,
+Spacing, Personality, and Logo. The logo is embedded as inline SVG when
+available, otherwise referenced by URL.
 """
 from __future__ import annotations
 
 from scraper import ScrapeResult
-
-COLOR_LABELS = {
-    "primary": "Primary",
-    "secondary": "Secondary",
-    "tertiary": "Tertiary",
-    "neutral": "Neutral",
-}
 
 
 def _yaml_escape(value: str) -> str:
@@ -22,26 +16,34 @@ def _yaml_escape(value: str) -> str:
 
 def _front_matter(r: ScrapeResult) -> str:
     lines = ["---", f'name: "{_yaml_escape(r.firm_name)}"', f'url: "{r.url}"']
+
     if r.logo.get("type") == "img" and r.logo.get("url"):
         lines.append(f'logo: "{r.logo["url"]}"')
     elif r.logo.get("type") == "svg":
         lines.append("logo: embedded")
-    lines.append("colors:")
-    for key in ("primary", "secondary", "tertiary", "neutral"):
-        lines.append(f'  {key}: "{r.colors[key]}"')
-    lines.append("typography:")
-    for key in ("h1", "body-md", "label-caps"):
-        token = r.typography[key]
-        lines.append(f"  {key}:")
-        lines.append(f"    fontFamily: {token['fontFamily']}")
-        lines.append(f"    fontSize: {token['fontSize']}")
-    lines.append("rounded:")
-    lines.append(f"  sm: {r.rounded['sm']}")
-    lines.append(f"  md: {r.rounded['md']}")
-    lines.append("spacing:")
-    lines.append(f"  sm: {r.spacing['sm']}")
-    lines.append(f"  md: {r.spacing['md']}")
-    lines.append("---")
+
+    lines += [
+        "colors:",
+        f'  primary: "{r.colors["primary"]}"',
+        f'  accent: "{r.colors["accent"]}"',
+        f'  background: "{r.colors["background"]}"',
+        f'  text_primary: "{r.colors["text_primary"]}"',
+        f'  link: "{r.colors["link"]}"',
+        "typography:",
+        f'  primary_font: "{_yaml_escape(r.typography["primary_font"])}"',
+        f'  heading_font: "{_yaml_escape(r.typography["heading_font"])}"',
+        f'  h1: "{r.typography["h1_size"]}"',
+        f'  h2: "{r.typography["h2_size"]}"',
+        f'  body: "{r.typography["body_size"]}"',
+        "spacing:",
+        f'  base_unit: {r.spacing["base_unit"]}',
+        f'  border_radius: "{r.spacing["border_radius"]}"',
+        "personality:",
+        f'  tone: "{_yaml_escape(r.personality["tone"])}"',
+        f'  energy: "{r.personality["energy"]}"',
+        f'  audience: "{_yaml_escape(r.personality["audience"])}"',
+        "---",
+    ]
     return "\n".join(lines)
 
 
@@ -51,18 +53,46 @@ def _body(r: ScrapeResult) -> str:
         "",
         "## Overview",
         "",
-        f"Design tokens reverse-engineered from [{r.url}]({r.url}). The front "
-        "matter above is machine-readable for agents; the notes below explain "
-        "how to apply it. Colors, fonts, radii, and the logo were extracted "
-        "automatically from the site's published styles and should be reviewed "
-        "and adjusted before use.",
+        f"Design tokens reverse-engineered from [{r.url}]({r.url}). "
+        "Colors, fonts, spacing, and logo were extracted automatically from "
+        "the site's published styles. Review all values before use.",
         "",
         "## Colors",
         "",
+        f"- **Primary** `{r.colors['primary']}`",
+        f"- **Accent** `{r.colors['accent']}`",
+        f"- **Background** `{r.colors['background']}`",
+        f"- **Text Primary** `{r.colors['text_primary']}`",
+        f"- **Link** `{r.colors['link']}`",
+        "",
+        "## Fonts",
+        "",
+        f"- **{r.typography['primary_font']}** (body)",
+        f"- **{r.typography['heading_font']}** (heading)",
+        "",
+        "## Typography",
+        "",
+        f"- primary: **{r.typography['primary_font']}**",
+        f"- heading: **{r.typography['heading_font']}**",
+        f"- h1: **{r.typography['h1_size']}**",
+        f"- h2: **{r.typography['h2_size']}**",
+        f"- body: **{r.typography['body_size']}**",
+        "",
+        "## Spacing",
+        "",
+        f"- Base Unit: **{r.spacing['base_unit']}**",
+        f"- Border Radius: **{r.spacing['border_radius']}**",
+        "",
+        "## Personality",
+        "",
+        f"- Tone: **{r.personality['tone']}**",
+        f"- Energy: **{r.personality['energy']}**",
+        f"- Audience: **{r.personality['audience']}**",
+        "",
+        "## Logo",
+        "",
     ]
-    for key, label in COLOR_LABELS.items():
-        parts.append(f"- **{label}** `{r.colors[key]}`")
-    parts += ["", "## Logo", ""]
+
     logo = r.logo
     if logo.get("type") == "svg" and logo.get("svg"):
         parts += ["Embedded inline SVG:", "", logo["svg"]]
@@ -74,6 +104,7 @@ def _body(r: ScrapeResult) -> str:
         ]
     else:
         parts.append("_No logo found during the scrape._")
+
     parts.append("")
     return "\n".join(parts)
 

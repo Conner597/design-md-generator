@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import reduce
+from math import gcd
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
@@ -56,6 +59,13 @@ ICON_HINT = re.compile(
     re.I,
 )
 
+# Regexes for enhanced token extraction
+RULE_BLOCK_RE = re.compile(r'([^{}/]+)\{([^{}]*)\}', re.S)
+FONT_SIZE_PROP_RE = re.compile(r'font-size\s*:\s*([^;}{]+)', re.I)
+SPACING_VAL_RE = re.compile(
+    r'(?:margin|padding)(?:-top|-right|-bottom|-left)?\s*:\s*([0-9.]+)px', re.I
+)
+
 GENERIC_FONTS = {
     "inherit", "initial", "unset", "sans-serif", "serif", "monospace",
     "system-ui", "ui-sans-serif", "ui-serif", "ui-monospace", "-apple-system",
@@ -64,9 +74,29 @@ GENERIC_FONTS = {
 
 DEFAULT_COLORS = {
     "primary": "#1A1C1E",
-    "secondary": "#6C7278",
-    "tertiary": "#B8422E",
-    "neutral": "#F7F5F2",
+    "accent": "#6C7278",
+    "background": "#F7F5F2",
+    "text_primary": "#1A1C1E",
+    "link": "#B8422E",
+}
+
+_TONE_KEYWORDS: dict[str, set[str]] = {
+    "Professional": {
+        "finance", "advisory", "investment", "wealth", "consulting", "law", "legal",
+        "compliance", "insurance", "accounting", "management", "services", "firm",
+    },
+    "Creative": {"design", "creative", "studio", "art", "brand", "agency", "portfolio", "visual"},
+    "Innovative": {
+        "tech", "software", "platform", "ai", "cloud", "digital", "startup",
+        "saas", "app", "developer", "api", "data",
+    },
+    "Friendly": {"community", "family", "kids", "local", "neighborhood", "together", "support"},
+    "Luxury": {"luxury", "premium", "exclusive", "bespoke", "estate", "concierge", "prestige"},
+}
+
+_ENERGY_HIGH_WORDS = {"dynamic", "fast", "instant", "live", "energetic", "exciting", "vibrant", "bold"}
+_ENERGY_LOW_WORDS = {
+    "trusted", "steady", "long-term", "stable", "heritage", "established", "conservative", "tradition",
 }
 
 _CSS_DUMP_JS = (
@@ -75,16 +105,59 @@ _CSS_DUMP_JS = (
     "return out.join('\\n'); }"
 )
 
+# JS executed inside Playwright to find the logo in the rendered DOM with visibility checks.
+_LOGO_EXTRACT_JS = """
+() => {
+    const svgSelectors = [
+        'header a svg', 'nav a svg',
+        '[class*="logo"] svg', '[id*="logo"] svg', '[class*="brand"] svg',
+        'a[href="/"] svg', "a[href='./'] svg",
+        '[class*="navbar"] svg', '[class*="nav-brand"] svg'
+    ];
+    for (const sel of svgSelectors) {
+        try {
+            for (const el of document.querySelectorAll(sel)) {
+                if (el.getAttribute('aria-hidden') === 'true') continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 20 || rect.height < 20) continue;
+                if (rect.width > 500 || rect.height > 250) continue;
+                const cls = String(el.className || '') + ' ' + String(el.id || '');
+                if (/menu|hamburger|search|close|arrow|chevron|social/i.test(cls)) continue;
+                return { type: 'svg', svg: el.outerHTML };
+            }
+        } catch(e) {}
+    }
+    const imgSelectors = [
+        'header img[class*="logo"]', 'nav img[class*="logo"]',
+        'img[alt*="logo" i]', 'img[src*="logo" i]',
+        '[class*="logo"] img', '[id*="logo"] img',
+        'header a img', 'nav a img'
+    ];
+    for (const sel of imgSelectors) {
+        try {
+            const el = document.querySelector(sel);
+            if (el) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    return { type: 'img', src: el.currentSrc || el.src };
+                }
+            }
+        } catch(e) {}
+    }
+    return null;
+}
+"""
+
 
 @dataclass
 class ScrapeResult:
     firm_name: str
     url: str
-    colors: dict
-    typography: dict
-    rounded: dict
-    spacing: dict
-    logo: dict
+    colors: dict      # primary, accent, background, text_primary, link
+    typography: dict  # primary_font, heading_font, h1_size, h2_size, body_size
+    spacing: dict     # base_unit (int), border_radius (str)
+    personality: dict # tone, energy, audience
+    logo: dict        # type, svg, url
 
 
 # --------------------------------------------------------------------------- #
@@ -121,11 +194,7 @@ def _hex_to_hsl(hex_str: str) -> tuple[float, float, float]:
 
 
 def _hsv_sat(hex_str: str) -> float:
-    """Colorfulness independent of darkness (HSV saturation = delta/max).
-
-    HSL saturation is misleadingly low for dark colors like a deep brand green;
-    HSV saturation stays high, so it's the better 'is this a real color' test.
-    """
+    """HSV saturation: colorfulness independent of darkness."""
     h = hex_str.lstrip("#")
     r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
     mx, mn = max(r, g, b), min(r, g, b)
@@ -178,8 +247,11 @@ def _get(session, url: str):
     return resp
 
 
-def _browser_fetch(url: str) -> tuple[str, str, str]:
-    """Render the page in headless Chromium to get past JavaScript challenges."""
+def _browser_fetch(url: str) -> tuple[str, str, str, dict | None]:
+    """Render in headless Chromium; also extracts logo via JS evaluation.
+
+    Returns (final_url, html, css, playwright_logo_hint).
+    """
     from playwright.sync_api import sync_playwright  # optional dependency
 
     with sync_playwright() as p:
@@ -190,13 +262,17 @@ def _browser_fetch(url: str) -> tuple[str, str, str]:
             html = page.content()
             final_url = page.url
             css = page.evaluate(_CSS_DUMP_JS)
+            try:
+                logo_hint = page.evaluate(_LOGO_EXTRACT_JS)
+            except Exception:
+                logo_hint = None
         finally:
             browser.close()
-    return final_url, html, css or ""
+    return final_url, html, css or "", logo_hint
 
 
-def fetch_site(url: str) -> tuple[str, str, str]:
-    """Return (final_url, html, combined_css), escalating through anti-bot layers."""
+def fetch_site(url: str) -> tuple[str, str, str, dict | None]:
+    """Return (final_url, html, combined_css, playwright_logo_hint), escalating through anti-bot layers."""
     cleaned = _clean_url(url)
     candidates = [cleaned]
     if _root(cleaned) != cleaned:
@@ -209,13 +285,10 @@ def fetch_site(url: str) -> tuple[str, str, str]:
                 resp = _get(sess, candidate)
                 final_url = str(resp.url)
                 html = resp.text
-                return final_url, html, _gather_css(sess, html, final_url)
-            except Exception as exc:  # noqa: BLE001 - try the next layer/candidate
+                return final_url, html, _gather_css(sess, html, final_url), None
+            except Exception as exc:  # noqa: BLE001
                 last_error = exc
 
-    # Final layer: headless browser (handles JS challenges). Optional dependency;
-    # if Playwright or its browser isn't installed, this raises and we surface the
-    # original HTTP error instead.
     try:
         return _browser_fetch(cleaned)
     except Exception as exc:  # noqa: BLE001
@@ -249,12 +322,7 @@ def _gather_css(session, html: str, base_url: str, max_sheets: int = 8) -> str:
 # Token extraction
 # --------------------------------------------------------------------------- #
 def _collect_color_weights(css: str, html: str) -> dict:
-    """Tally colors, weighting the signals that actually indicate a brand color.
-
-    Counts literal hex/rgb, but adds extra weight for colors used in backgrounds,
-    colors referenced through CSS variables (resolving the variable to its value),
-    and the <meta name="theme-color"> brand declaration.
-    """
+    """Tally colors, weighting the signals that actually indicate a brand color."""
     weights: dict[str, int] = {}
 
     def add(hex_value: str, amount: int = 1) -> None:
@@ -268,11 +336,9 @@ def _collect_color_weights(css: str, html: str) -> dict:
     text = css + " " + html
     for hx in colors_in(text):
         add(hx, 1)
-    # Brand colors are usually backgrounds — weight those more.
     for decl in BG_DECL_RE.findall(css):
         for hx in colors_in(decl):
             add(hx, 3)
-    # Resolve CSS variables: map --name -> hex, then count each var() usage.
     var_hex: dict[str, str] = {}
     for name, value in CSS_VAR_DEF_RE.findall(css):
         found = colors_in(value)
@@ -281,12 +347,28 @@ def _collect_color_weights(css: str, html: str) -> dict:
     for name in VAR_USE_RE.findall(css):
         if name in var_hex:
             add(var_hex[name], 3)
-    # theme-color meta is an explicit brand-color declaration.
     meta = BeautifulSoup(html, "html.parser").find("meta", attrs={"name": "theme-color"})
     if meta and meta.get("content"):
         for hx in colors_in(meta["content"]):
             add(hx, 25)
     return weights
+
+
+def _extract_link_color(css: str, fallback: str, background: str) -> str:
+    """Find the color declared on bare <a> elements (not hover/active/visited).
+
+    Skips any candidate that is too close to the background — that would mean
+    links are invisible (e.g. a white label on a colored button container).
+    """
+    for m in RULE_BLOCK_RE.finditer(css):
+        sel = m.group(1).strip()
+        if re.search(r'\ba\b', sel) and not re.search(r'hover|visited|active|focus', sel, re.I):
+            hexes = [_normalize_hex(h) for h in HEX_RE.findall(m.group(2))]
+            hexes += [_rgb_to_hex(int(r), int(g), int(b)) for r, g, b in RGB_RE.findall(m.group(2))]
+            for hx in hexes:
+                if hx != background and _hex_to_hsl(hx)[2] < 0.9:
+                    return hx
+    return fallback
 
 
 def extract_colors(css: str, html: str) -> dict:
@@ -296,31 +378,62 @@ def extract_colors(css: str, html: str) -> dict:
 
     ranked = [h for h, _ in sorted(weights.items(), key=lambda kv: kv[1], reverse=True)]
     chromatic = [h for h in ranked if _is_chromatic(h)]
-    light = next((h for h in ranked if _hex_to_hsl(h)[2] > 0.82), None)
+    light_colors = [h for h in ranked if _hex_to_hsl(h)[2] > 0.82]
+    dark_colors = [h for h in ranked if _hex_to_hsl(h)[2] < 0.35]
 
-    chosen: dict[str, str | None] = {
-        "primary": None, "secondary": None, "tertiary": None, "neutral": light,
+    primary = chromatic[0] if chromatic else (dark_colors[0] if dark_colors else ranked[0])
+    accent = chromatic[1] if len(chromatic) > 1 else primary
+    background = light_colors[0] if light_colors else "#FFFFFF"
+    text_primary = dark_colors[0] if dark_colors else primary
+    link = _extract_link_color(css, primary, background)
+
+    return {
+        "primary": primary,
+        "accent": accent,
+        "background": background,
+        "text_primary": text_primary,
+        "link": link,
     }
-    # Lead with the actual brand colors (most prominent chromatic ones).
-    pool = list(chromatic)
-    for key in ("primary", "secondary", "tertiary"):
-        if pool:
-            chosen[key] = pool.pop(0)
-    # Monochrome brand (no chromatic colors): fall back to the dominant dark tone.
-    if not chosen["primary"]:
-        chosen["primary"] = next((h for h in ranked if _hex_to_hsl(h)[2] < 0.3), None)
 
-    def next_unused() -> str | None:
-        used = {v for v in chosen.values() if v}
-        return next((h for h in ranked if h not in used), None)
 
-    for key in ("primary", "secondary", "tertiary", "neutral"):
-        if not chosen[key]:
-            chosen[key] = next_unused()
-    for key, fallback in DEFAULT_COLORS.items():
-        if not chosen[key]:
-            chosen[key] = fallback
-    return {k: chosen[k] for k in ("primary", "secondary", "tertiary", "neutral")}
+def _to_px(value: str, base: int = 16) -> str | None:
+    """Convert a CSS length (px/rem/em) to a px string, or return None if unparseable."""
+    v = value.strip().lower()
+    m = re.match(r'^([0-9.]+)(px|rem|em)$', v)
+    if not m:
+        return None
+    num, unit = float(m.group(1)), m.group(2)
+    if unit == 'px':
+        return f"{int(round(num))}px"
+    return f"{int(round(num * base))}px"
+
+
+def _size_for_selector(css: str, selector_pattern: str) -> str | None:
+    """Return the font-size for the first CSS rule whose selector matches the pattern."""
+    pattern = re.compile(selector_pattern, re.I)
+    for m in RULE_BLOCK_RE.finditer(css):
+        sel = m.group(1).strip()
+        if pattern.search(sel) and not re.search(r'@media|@supports', sel, re.I):
+            fs_m = FONT_SIZE_PROP_RE.search(m.group(2))
+            if fs_m:
+                result = _to_px(fs_m.group(1).strip())
+                if result:
+                    return result
+    return None
+
+
+def _font_in_selector(css: str, selector_pattern: str) -> str | None:
+    """Return the first named font-family found in rules matching selector_pattern."""
+    pattern = re.compile(selector_pattern, re.I)
+    for m in RULE_BLOCK_RE.finditer(css):
+        sel = m.group(1).strip()
+        if pattern.search(sel) and not re.search(r'@media|@supports|@keyframes', sel, re.I):
+            ff_m = FONT_RE.search(m.group(2))
+            if ff_m:
+                first = ff_m.group(1).split(",")[0].strip().strip("'\"")
+                if first and first.lower() not in GENERIC_FONTS:
+                    return first
+    return None
 
 
 def extract_typography(css: str) -> dict:
@@ -329,28 +442,122 @@ def extract_typography(css: str) -> dict:
         first = raw.split(",")[0].strip().strip("'\"")
         if first and first.lower() not in GENERIC_FONTS:
             freq[first] = freq.get(first, 0) + 1
-    ranked = [f for f, _ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)]
-    body = ranked[0] if ranked else "Public Sans"
-    heading = ranked[1] if len(ranked) > 1 else body
-    label = ranked[1] if len(ranked) > 1 else "Space Grotesk"
+    ranked_fonts = [f for f, _ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)]
+
+    # Look for fonts explicitly used in heading vs body selectors — more reliable
+    # than raw frequency, which can get the roles backwards on sites that define
+    # heading styles with more declarations than body styles.
+    heading_from_css = _font_in_selector(css, r'\bh[1-3]\b')
+    body_from_css = _font_in_selector(css, r'\bbody\b')
+
+    if heading_from_css and body_from_css and heading_from_css != body_from_css:
+        primary_font = body_from_css
+        heading_font = heading_from_css
+    elif heading_from_css:
+        # We know the heading font; pick the most-frequent *other* font for body.
+        primary_font = next((f for f in ranked_fonts if f != heading_from_css), heading_from_css)
+        heading_font = heading_from_css
+    elif body_from_css:
+        primary_font = body_from_css
+        heading_font = next((f for f in ranked_fonts if f != body_from_css), body_from_css)
+    else:
+        primary_font = ranked_fonts[0] if ranked_fonts else "Public Sans"
+        heading_font = ranked_fonts[1] if len(ranked_fonts) > 1 else primary_font
+
+    h1_size = _size_for_selector(css, r'\bh1\b') or "48px"
+    h2_size = _size_for_selector(css, r'\bh2\b') or "32px"
+    body_size = (
+        _size_for_selector(css, r'\bbody\b')
+        or _size_for_selector(css, r'\bp\b')
+        or "16px"
+    )
+
     return {
-        "h1": {"fontFamily": heading, "fontSize": "3rem"},
-        "body-md": {"fontFamily": body, "fontSize": "1rem"},
-        "label-caps": {"fontFamily": label, "fontSize": "0.75rem"},
+        "primary_font": primary_font,
+        "heading_font": heading_font,
+        "h1_size": h1_size,
+        "h2_size": h2_size,
+        "body_size": body_size,
     }
 
 
-def extract_rounded(css: str) -> dict:
-    vals = sorted({int(round(float(v))) for v in RADIUS_RE.findall(css) if 0 < float(v) <= 64})
-    if len(vals) >= 2:
-        return {"sm": f"{vals[0]}px", "md": f"{vals[1]}px"}
-    if len(vals) == 1:
-        return {"sm": f"{vals[0]}px", "md": f"{vals[0] * 2}px"}
-    return {"sm": "4px", "md": "8px"}
+def extract_spacing(css: str) -> dict:
+    radius_vals = [
+        int(round(float(v))) for v in RADIUS_RE.findall(css) if 0 < float(v) <= 64
+    ]
+    border_radius = (
+        f"{Counter(radius_vals).most_common(1)[0][0]}px" if radius_vals else "0px"
+    )
+
+    spacing_vals = [
+        int(round(float(v))) for v in SPACING_VAL_RE.findall(css) if 0 < float(v) <= 128
+    ]
+    base_unit = 4
+    if len(spacing_vals) >= 3:
+        small_vals = sorted(set(v for v in spacing_vals if v >= 2))[:20]
+        if small_vals:
+            try:
+                g = reduce(gcd, small_vals)
+                if g in (2, 4, 6, 8, 10, 12, 16):
+                    base_unit = g
+            except Exception:
+                pass
+
+    return {"base_unit": base_unit, "border_radius": border_radius}
+
+
+def extract_personality(html: str, colors: dict) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    text = " ".join(t for t in soup.stripped_strings)[:8000].lower()
+
+    tone = "Professional"
+    best_score = 0
+    for tone_name, keywords in _TONE_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in text)
+        if score > best_score:
+            best_score, tone = score, tone_name
+
+    primary_sat = _hsv_sat(colors.get("primary", "#1A1C1E"))
+    accent_sat = _hsv_sat(colors.get("accent", colors.get("primary", "#1A1C1E")))
+    avg_sat = (primary_sat + accent_sat) / 2
+
+    if any(w in text for w in _ENERGY_LOW_WORDS):
+        energy = "Low"
+    elif avg_sat > 0.55 or any(w in text for w in _ENERGY_HIGH_WORDS):
+        energy = "High"
+    elif avg_sat > 0.25:
+        energy = "Medium"
+    else:
+        energy = "Low"
+
+    def _trim_at_word(s: str, limit: int) -> str:
+        if len(s) <= limit:
+            return s
+        return s[:limit].rsplit(" ", 1)[0].rstrip(".,;:")
+
+    audience = ""
+    meta_desc = soup.find("meta", attrs={"name": "description"})
+    if meta_desc and meta_desc.get("content"):
+        desc = meta_desc["content"].strip()
+        for pattern in [r"for ([^.]+)", r"serving ([^.]+)", r"helping ([^.]+)"]:
+            m = re.search(pattern, desc, re.I)
+            if m:
+                audience = _trim_at_word(m.group(1).strip().rstrip(",."), 100)
+                break
+        if not audience:
+            audience = _trim_at_word(desc, 150)
+    if not audience:
+        og_desc = soup.find("meta", property="og:description")
+        if og_desc and og_desc.get("content"):
+            audience = _trim_at_word(og_desc["content"].strip(), 150)
+    if not audience:
+        audience = "General"
+
+    return {"tone": tone, "energy": energy, "audience": audience}
 
 
 # --------------------------------------------------------------------------- #
-# Logo detection (scored: prefer the real brand mark, reject UI icons)
+# Logo detection (HTML-based: scored heuristics)
 # --------------------------------------------------------------------------- #
 def _attr_blob(el) -> str:
     cls = " ".join(el.get("class") or [])
@@ -386,7 +593,7 @@ def _svg_is_square(svg) -> bool:
 
 
 def _svg_looks_like_logo(svg) -> bool:
-    """Accept a brand-mark SVG; reject UI icons (search, menu, map pins, square glyphs)."""
+    """Accept a brand-mark SVG; reject UI icons (search, menu, map pins, etc.)."""
     self_blob = _attr_blob(svg)
     self_branded = bool(BRAND_HINT.search(self_blob))
     if not (self_branded or _has_brand_ancestor(svg)):
@@ -397,8 +604,6 @@ def _svg_looks_like_logo(svg) -> bool:
         return False
     if (svg.get("width") or "").strip().lower().endswith("em") and not self_branded:
         return False
-    # Icons are square; brand wordmarks are usually wider than tall. Only trust a
-    # square SVG as a logo if it explicitly carries a logo/brand label itself.
     if _svg_is_square(svg) and not self_branded:
         return False
     return True
@@ -527,14 +732,149 @@ def extract_logo(html: str, base_url: str) -> dict:
     return {"type": "img", "url": payload, "svg": None}
 
 
+def _fetch_svg_file(url: str) -> str | None:
+    """Download a URL and return its content if it is (or contains) SVG markup."""
+    try:
+        with _session() as sess:
+            resp = _get(sess, url)
+            ct = (resp.headers.get("content-type") or "").split(";")[0].strip()
+            text = resp.text if hasattr(resp, "text") else resp.content.decode("utf-8", errors="replace")
+            if ct == "image/svg+xml" or "<svg" in text.lower():
+                return text.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _raster_url_to_svg(url: str) -> str | None:
+    """Download a raster image and embed it base64-encoded inside an SVG wrapper.
+
+    If the server returns an SVG content-type despite a non-.svg extension,
+    the raw SVG is inlined directly instead of being base64-wrapped.
+    """
+    import base64 as _base64
+    try:
+        with _session() as sess:
+            resp = _get(sess, url)
+            ct = (resp.headers.get("content-type") or "image/png").split(";")[0].strip()
+            if ct == "image/svg+xml":
+                text = resp.text if hasattr(resp, "text") else resp.content.decode("utf-8", errors="replace")
+                if "<svg" in text.lower():
+                    return text.strip()
+            raw = resp.content
+            if ct not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+                ct = "image/png"
+            b64 = _base64.b64encode(raw).decode("ascii")
+            return (
+                '<svg xmlns="http://www.w3.org/2000/svg" '
+                'xmlns:xlink="http://www.w3.org/1999/xlink">\n'
+                f'  <image href="data:{ct};base64,{b64}" '
+                'width="100%" height="100%" preserveAspectRatio="xMidYMid meet"/>\n'
+                '</svg>'
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _normalize_logo_to_svg(logo: dict) -> dict:
+    """Ensure the logo is always stored as SVG in the output.
+
+    - Inline SVG already: returned unchanged.
+    - URL ending in .svg: fetched and inlined.
+    - Raster URL (png/jpg/etc.): downloaded, base64-encoded, wrapped in <svg>.
+    - Falls back to the original dict if every download attempt fails.
+    """
+    if logo.get("type") == "svg":
+        return logo
+    if logo.get("type") != "img" or not logo.get("url"):
+        return logo
+    url = logo["url"]
+    if urlparse(url).path.lower().endswith(".svg"):
+        svg = _fetch_svg_file(url)
+        if svg:
+            return {"type": "svg", "svg": svg, "url": None}
+    svg = _raster_url_to_svg(url)
+    if svg:
+        return {"type": "svg", "svg": svg, "url": None}
+    return logo
+
+
+def _playwright_logo_to_result(hint: dict | None, base_url: str) -> dict | None:
+    """Convert the raw JS evaluation result from _LOGO_EXTRACT_JS to a logo dict."""
+    if not hint:
+        return None
+    if hint.get("type") == "svg" and hint.get("svg"):
+        return {"type": "svg", "svg": hint["svg"], "url": None}
+    if hint.get("type") == "img" and hint.get("src"):
+        src = hint["src"]
+        if not src.startswith("data:"):
+            return {"type": "img", "url": urljoin(base_url, src), "svg": None}
+    return None
+
+
+def _playwright_logo_pass(url: str) -> dict | None:
+    """Open a minimal Playwright session solely to run the JS logo finder.
+
+    Called when the HTTP fetch path succeeded (so Playwright wasn't used for
+    fetching) but the HTML-based logo detection didn't yield an SVG. Many sites
+    inject their header logo via JavaScript, which only the rendered DOM exposes.
+    Uses domcontentloaded (faster than networkidle) since we only need the DOM.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(user_agent=BROWSER_HEADERS["User-Agent"])
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                # Brief wait for hydration of JS frameworks (React/Vue/etc.)
+                page.wait_for_timeout(1500)
+                return page.evaluate(_LOGO_EXTRACT_JS)
+            finally:
+                browser.close()
+    except Exception:
+        return None
+
+
 def scrape(firm_name: str, url: str) -> ScrapeResult:
-    final_url, html, css = fetch_site(url)
+    final_url, html, css, playwright_logo = fetch_site(url)
+    colors = extract_colors(css, html)
+
+    # Start with the HTML-based heuristic (always available).
+    html_logo = extract_logo(html, final_url)
+
+    # Playwright logo hint from the fetch layer (only present when Playwright
+    # was used for fetching, i.e., HTTP layers failed).
+    fetch_pw_logo = _playwright_logo_to_result(playwright_logo, final_url)
+
+    # If we don't already have an SVG from either source, run a dedicated
+    # Playwright pass. JS-rendered sites inject the header logo dynamically;
+    # the static HTML never contains it.
+    if fetch_pw_logo and fetch_pw_logo.get("type") == "svg":
+        logo = fetch_pw_logo
+    elif html_logo.get("type") == "svg":
+        logo = html_logo
+    else:
+        # No SVG yet — try Playwright's visibility-aware JS finder.
+        pw_hint = _playwright_logo_pass(final_url)
+        pw_logo = _playwright_logo_to_result(pw_hint, final_url)
+        # Prefer an SVG from Playwright; fall back to the best HTML result.
+        if pw_logo and pw_logo.get("type") == "svg":
+            logo = pw_logo
+        else:
+            logo = fetch_pw_logo or pw_logo or html_logo
+
+    # Always convert the final logo to SVG — embed inline SVG files and
+    # base64-wrap raster images so the output never contains a bare img URL.
+    logo = _normalize_logo_to_svg(logo)
+
     return ScrapeResult(
         firm_name=firm_name,
         url=final_url,
-        colors=extract_colors(css, html),
+        colors=colors,
         typography=extract_typography(css),
-        rounded=extract_rounded(css),
-        spacing={"sm": "8px", "md": "16px"},
-        logo=extract_logo(html, final_url),
+        spacing=extract_spacing(css),
+        personality=extract_personality(html, colors),
+        logo=logo,
     )
