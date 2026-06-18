@@ -1332,7 +1332,7 @@ def _firecrawl_fetch(url: str) -> tuple[str, dict, dict] | None:
     Returns (final_url, metadata, branding_dict) or None on any failure.
     """
     try:
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=90.0) as client:
             resp = client.post(
                 FIRECRAWL_API_URL,
                 headers={
