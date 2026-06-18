@@ -1609,6 +1609,14 @@ def _valid_hex(value) -> str | None:
     if not isinstance(value, str):
         return None
     v = value.strip()
+    # 8-char hex with alpha (#RRGGBBAA) → strip alpha to #RRGGBB
+    m8 = re.match(r'^#([0-9a-fA-F]{6})[0-9a-fA-F]{2}$', v)
+    if m8:
+        v = "#" + m8.group(1)
+    # 4-char hex with alpha (#RGBA) → expand to #RRGGBB
+    m4 = re.match(r'^#([0-9a-fA-F])([0-9a-fA-F])([0-9a-fA-F])[0-9a-fA-F]$', v)
+    if m4:
+        v = "#" + m4.group(1) * 2 + m4.group(2) * 2 + m4.group(3) * 2
     if re.match(r'^#[0-9a-fA-F]{3}$|^#[0-9a-fA-F]{6}$', v):
         return _normalize_hex(v)
     return None
@@ -1620,9 +1628,14 @@ def _valid_px(value) -> str | None:
     v = value.strip()
     if re.match(r'^\d+(\.\d+)?px$', v, re.I):
         return v
+    # bare number
     m = re.match(r'^(\d+(\.\d+)?)$', v)
     if m:
         return f"{int(float(m.group(1)))}px"
+    # rem/em → approximate px (16px base)
+    m = re.match(r'^(\d+(\.\d+)?)(rem|em)$', v, re.I)
+    if m:
+        return f"{round(float(m.group(1)) * 16)}px"
     return None
 
 
