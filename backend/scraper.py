@@ -1628,14 +1628,9 @@ def _valid_px(value) -> str | None:
     v = value.strip()
     if re.match(r'^\d+(\.\d+)?px$', v, re.I):
         return v
-    # bare number
     m = re.match(r'^(\d+(\.\d+)?)$', v)
     if m:
         return f"{int(float(m.group(1)))}px"
-    # rem/em → approximate px (16px base)
-    m = re.match(r'^(\d+(\.\d+)?)(rem|em)$', v, re.I)
-    if m:
-        return f"{round(float(m.group(1)) * 16)}px"
     return None
 
 
@@ -1655,6 +1650,9 @@ def scrape(firm_name: str, url: str) -> ScrapeResult:
         fc_final_url, _fc_meta, fc_branding_raw = fc_result
         fc_brand = _parse_branding_response(fc_branding_raw)
         logger.info("Firecrawl branding retrieved for %s", url)
+        logger.info("FC raw colors: %s", fc_branding_raw.get("colors", {}))
+        logger.info("FC raw typography sizes: %s", (fc_branding_raw.get("typography") or {}).get("fontSizes", {}))
+        logger.info("FC raw spacing: %s", fc_branding_raw.get("spacing", {}))
     else:
         fc_final_url = _fc_meta = fc_branding_raw = fc_brand = None
         logger.info("Firecrawl unavailable; using in-house only for %s", url)
