@@ -1,8 +1,8 @@
 """Render a ScrapeResult into a DESIGN.md string.
 
 Format: YAML front matter (design tokens) followed by human-readable markdown
-sections: Colors, Fonts, Typography, Spacing, Personality, Components, and
-Logo & Images. The logo is embedded as inline SVG when available.
+sections: Colors, Fonts, Typography, Spacing, Components, and Logo & Images.
+The logo is embedded as inline SVG when available.
 """
 from __future__ import annotations
 
@@ -46,10 +46,6 @@ def _front_matter(r: ScrapeResult) -> str:
         "spacing:",
         f'  base_unit: {r.spacing["base_unit"]}',
         f'  border_radius: "{r.spacing["border_radius"]}"',
-        "personality:",
-        f'  tone: "{_yaml_escape(r.personality["tone"])}"',
-        f'  energy: "{r.personality["energy"]}"',
-        f'  audience: "{_yaml_escape(r.personality["audience"])}"',
     ]
 
     # Components (present when FC branding returned button data)
@@ -124,12 +120,6 @@ def _body(r: ScrapeResult) -> str:
         "",
         f"- Base Unit: **{r.spacing['base_unit']}**",
         f"- Border Radius: **{r.spacing['border_radius']}**",
-        "",
-        "## Personality",
-        "",
-        f"- Tone: **{r.personality['tone']}**",
-        f"- Energy: **{r.personality['energy']}**",
-        f"- Audience: **{r.personality['audience']}**",
         "",
     ]
 
